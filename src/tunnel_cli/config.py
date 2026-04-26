@@ -1,16 +1,17 @@
 import json
 import os
-from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
 import click
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from .paths import config_path, credentials_path
 
 
-@dataclass(frozen=True)
-class TunnelConfig:
+class TunnelConfig(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     account_id: str
     zone_id: str
     zone_name: str
@@ -21,17 +22,53 @@ class TunnelConfig:
     cloudflared_credentials: str
     service_scheme: str
     service_host: str
-    service_port: int
+    service_port: int = Field(ge=1, le=65535)
+
+    @field_validator(
+        "account_id",
+        "zone_id",
+        "zone_name",
+        "tunnel_id",
+        "tunnel_name",
+        "hostname",
+        "cloudflared_config",
+        "cloudflared_credentials",
+        "service_scheme",
+        "service_host",
+        mode="before",
+    )
+    @classmethod
+    def strip_required_string(cls, value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be a non-empty string")
+        return value.strip()
 
     @property
     def service_url(self) -> str:
         return f"{self.service_scheme}://{self.service_host}:{self.service_port}"
 
 
-@dataclass(frozen=True)
-class Credentials:
+class Credentials(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     api_token: str
     account_id: str | None = None
+
+    @field_validator("api_token", mode="before")
+    @classmethod
+    def strip_api_token(cls, value: Any) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be a non-empty string")
+        return value.strip()
+
+    @field_validator("account_id", mode="before")
+    @classmethod
+    def strip_account_id(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("must be a non-empty string")
+        return value.strip()
 
 
 def read_json_file(path: Path) -> dict[str, Any] | None:
@@ -56,15 +93,10 @@ def write_json_file(path: Path, payload: dict[str, Any], secret: bool = False) -
 
 
 def parse_credentials(raw: dict[str, Any]) -> Credentials:
-    api_token = raw.get("api_token")
-    if not isinstance(api_token, str) or not api_token.strip():
-        raise click.ClickException(f"missing api_token in {credentials_path()}")
-    account_id = raw.get("account_id")
-    if account_id is None:
-        return Credentials(api_token=api_token.strip())
-    if not isinstance(account_id, str) or not account_id.strip():
-        raise click.ClickException(f"account_id must be a non-empty string in {credentials_path()}")
-    return Credentials(api_token=api_token.strip(), account_id=account_id.strip())
+    try:
+        return Credentials.model_validate(raw)
+    except ValidationError as exc:
+        raise click.ClickException(f"invalid credentials in {credentials_path()}: {exc}") from exc
 
 
 def load_credentials() -> Credentials | None:
@@ -75,26 +107,14 @@ def load_credentials() -> Credentials | None:
 
 
 def save_credentials(credentials: Credentials) -> None:
-    payload: dict[str, Any] = {"api_token": credentials.api_token}
-    if credentials.account_id:
-        payload["account_id"] = credentials.account_id
-    write_json_file(credentials_path(), payload, secret=True)
+    write_json_file(credentials_path(), credentials.model_dump(exclude_none=True), secret=True)
 
 
 def parse_tunnel_config(raw: dict[str, Any]) -> TunnelConfig:
     try:
-        service_port = int(raw["service_port"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise click.ClickException(f"invalid service_port in {config_path()}") from exc
-
-    values: dict[str, str] = {}
-    for key in (field.name for field in fields(TunnelConfig) if field.name != "service_port"):
-        value = raw.get(key)
-        if not isinstance(value, str) or not value.strip():
-            raise click.ClickException(f"missing {key} in {config_path()}")
-        values[key] = value.strip()
-
-    return TunnelConfig(service_port=service_port, **values)
+        return TunnelConfig.model_validate(raw)
+    except ValidationError as exc:
+        raise click.ClickException(f"invalid config in {config_path()}: {exc}") from exc
 
 
 def load_tunnel_config() -> TunnelConfig | None:
@@ -116,7 +136,7 @@ def save_tunnel_config_values(values: dict[str, Any]) -> None:
 
 
 def save_tunnel_config(config: TunnelConfig) -> None:
-    write_json_file(config_path(), asdict(config))
+    write_json_file(config_path(), config.model_dump())
 
 
 def redact_token(token: str) -> str:

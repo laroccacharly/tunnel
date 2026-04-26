@@ -1,25 +1,61 @@
 import json
-from dataclasses import dataclass
 from typing import Any
 
 import click
 import requests
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 API_BASE_URL = "https://api.cloudflare.com/client/v4"
 
 
-@dataclass(frozen=True)
-class Zone:
+class Zone(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     id: str
     name: str
     account_id: str
     account_name: str
 
 
-@dataclass(frozen=True)
-class CloudflareTunnel:
+class CloudflareTunnel(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
     id: str
     name: str
+
+
+class ZoneAccount(BaseModel):
+    id: str
+    name: str
+
+
+class ZoneResult(BaseModel):
+    id: str
+    name: str
+    account: ZoneAccount
+
+    def to_zone(self) -> Zone:
+        return Zone(id=self.id, name=self.name, account_id=self.account.id, account_name=self.account.name)
+
+
+class DnsRecord(BaseModel):
+    id: str
+    content: str = ""
+
+
+class DnsRecordPayload(BaseModel):
+    type: str = "CNAME"
+    name: str
+    content: str
+    ttl: int = 1
+    proxied: bool = True
+
+
+class V4Response(BaseModel):
+    result: Any = None
+    success: bool | None = None
+    errors: list[Any] = Field(default_factory=list)
+    messages: list[Any] = Field(default_factory=list)
 
 
 class CloudflareClient:
@@ -129,6 +165,10 @@ class CloudflareClient:
                 f"Cloudflare API {method} {path} returned JSON that was not an object: {type(payload).__name__!r}\n"
                 f"Raw: {str(payload)[:2000]!r}"
             )
+        try:
+            V4Response.model_validate(payload)
+        except ValidationError as exc:
+            raise click.ClickException(f"Cloudflare API {method} {path} returned invalid v4 JSON: {exc}") from exc
         if response.ok and payload.get("success") is True:
             return payload
         self._raise_v4_error(method, path, response, payload)
@@ -182,52 +222,22 @@ class CloudflareClient:
     def list_zones(self) -> list[Zone]:
         zones: list[Zone] = []
         for item in self.result_list("GET", "/zones", params={"per_page": 50}, label="zones"):
-            if not isinstance(item, dict):
+            try:
+                zones.append(ZoneResult.model_validate(item).to_zone())
+            except ValidationError:
                 continue
-            zone_id = item.get("id")
-            zone_name = item.get("name")
-            account = item.get("account")
-            if not isinstance(zone_id, str) or not isinstance(zone_name, str):
-                continue
-            if not isinstance(account, dict):
-                continue
-            account_id = account.get("id")
-            account_name = account.get("name")
-            if isinstance(account_id, str) and isinstance(account_name, str):
-                zones.append(Zone(zone_id, zone_name, account_id, account_name))
         return zones
-
-    def list_tunnels(self, account_id: str) -> list[CloudflareTunnel]:
-        tunnels: list[CloudflareTunnel] = []
-        for item in self.result_list(
-            "GET",
-            f"/accounts/{account_id}/cfd_tunnel",
-            params={"is_deleted": "false"},
-            label="tunnels",
-        ):
-            if not isinstance(item, dict):
-                continue
-            tunnel_id = item.get("id")
-            name = item.get("name")
-            if isinstance(tunnel_id, str) and isinstance(name, str):
-                tunnels.append(CloudflareTunnel(id=tunnel_id, name=name))
-        return tunnels
 
     def upsert_dns_cname(self, zone_id: str, hostname: str, tunnel_id: str) -> None:
         target = f"{tunnel_id}.cfargotunnel.com"
-        record_payload = {
-            "type": "CNAME",
-            "name": hostname,
-            "content": target,
-            "ttl": 1,
-            "proxied": True,
-        }
+        record_payload = DnsRecordPayload(name=hostname, content=target).model_dump()
         for item in self.dns_records(zone_id, hostname):
-            if not isinstance(item, dict):
+            try:
+                record = DnsRecord.model_validate(item)
+            except ValidationError:
                 continue
-            record_id = item.get("id")
-            if isinstance(record_id, str):
-                self.request("PUT", f"/zones/{zone_id}/dns_records/{record_id}", json_body=record_payload)
+            if record.id:
+                self.request("PUT", f"/zones/{zone_id}/dns_records/{record.id}", json_body=record_payload)
                 return
 
         self.request("POST", f"/zones/{zone_id}/dns_records", json_body=record_payload)
@@ -240,14 +250,12 @@ class CloudflareClient:
         target = self._normalize_dns_target(f"{tunnel_id}.cfargotunnel.com")
         removed = 0
         for item in self.dns_records(zone_id, hostname):
-            if not isinstance(item, dict):
+            try:
+                record = DnsRecord.model_validate(item)
+            except ValidationError:
                 continue
-            content = item.get("content")
-            record_id = item.get("id")
-            if not isinstance(content, str) or not isinstance(record_id, str):
+            if self._normalize_dns_target(record.content) != target:
                 continue
-            if self._normalize_dns_target(content) != target:
-                continue
-            self.request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+            self.request("DELETE", f"/zones/{zone_id}/dns_records/{record.id}")
             removed += 1
         return removed
