@@ -385,6 +385,7 @@ def init() -> None:
     click.echo(f"Wrote config: {config_path()}")
     click.echo(f"Wrote cloudflared config: {cloudflared_config_path()}")
     click.echo(f"Configured https://{hostname} -> {service_url}")
+    click.echo("Run `tunnel run` to start the tunnel.")
 
 
 @cli.command(name="config")
@@ -447,6 +448,48 @@ def doctor() -> None:
         click.echo(f"{'[OK]' if ok else '[FAIL]'} {name}: {detail}")
     if failed:
         raise click.ClickException("doctor checks failed")
+
+
+@cli.command(name="delete")
+@click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation.")
+def delete_tunnel(yes: bool) -> None:
+    """Delete the tunnel CNAME in DNS (API), delete the tunnel in Cloudflare (cloudflared), then remove local files."""
+    if not command_exists("cloudflared"):
+        raise click.ClickException("command not found: cloudflared")
+
+    config = require_config()
+    credentials = require_credentials()
+    if not yes:
+        click.confirm(
+            f"This will remove the CNAME for {config.hostname!r} via the API (if present), run "
+            f"`cloudflared tunnel delete` for {config.tunnel_name!r} ({config.tunnel_id}), and remove local config under "
+            f"{config_path().parent}. Your API token file is kept. Continue?",
+            abort=True,
+        )
+
+    client = CloudflareClient(credentials.api_token)
+    removed_dns = client.delete_dns_cname_to_tunnel(config.zone_id, config.hostname, config.tunnel_id)
+    if removed_dns:
+        click.echo(f"Removed {removed_dns} DNS CNAME record(s) for {config.hostname} (API).")
+    else:
+        click.echo(f"No CNAME for {config.hostname} pointing at this tunnel (API; skipped or already removed).")
+
+    # Uses ~/.cloudflared/cert.pem (cloudflared tunnel login), not the API token.
+    run_command(["cloudflared", "tunnel", "delete", "-f", config.tunnel_name])
+    click.echo(f"Deleted Cloudflare tunnel {config.tunnel_name} (via cloudflared).")
+
+    for path_str, label in (
+        (config.cloudflared_config, "cloudflared config"),
+        (config.cloudflared_credentials, "tunnel credentials"),
+        (str(config_path()), "tunnel config"),
+    ):
+        path = Path(path_str)
+        if not path.is_file():
+            continue
+        path.unlink()
+        click.echo(f"Removed {label}: {path}")
+
+    click.echo("Done. Run `tunnel init` to set up a new tunnel.")
 
 
 if __name__ == "__main__":

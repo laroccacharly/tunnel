@@ -1,4 +1,5 @@
 import base64
+import json
 import secrets
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,118 @@ class CloudflareClient:
     def __init__(self, api_token: str):
         self.api_token = api_token
 
+    def _raise_v4_error(self, method: str, path: str, response: requests.Response, payload: dict[str, Any]) -> None:
+        status = response.status_code
+        lines: list[str] = [
+            f"Cloudflare API {method} {path} failed (HTTP {status}).",
+        ]
+        ray = response.headers.get("cf-ray")
+        if ray:
+            lines.append(f"cf-ray: {ray} (quote this if you contact Cloudflare support)")
+        if status in (401, 403) and "/cfd_tunnel" in path:
+            lines.append(
+                "Hint: Tunnels are account-scoped. Zone API permissions (DNS Read/Write, Zone Read, "
+                "Settings, etc.) do not apply to /accounts/.../cfd_tunnel/... — you need a separate line on "
+                "the token for this account, e.g. Account → Cloudflare Tunnel → Edit (and Read, if offered). "
+                "That is why `tunnel init` can still work (DNS) while `tunnel delete` fails here."
+            )
+            lines.append(
+                "Workaround: if `cloudflared tunnel login` works on this machine, run: "
+                "`cloudflared tunnel delete` with your tunnel name (uses cert.pem, not the API token)."
+            )
+        elif status in (401, 403):
+            lines.append(
+                "Hint: The API token in ~/.tunnel/credentials.json may be wrong, expired, or lack "
+                "permission for this call (e.g. Account for tunnels, Zone for DNS)."
+            )
+
+        errors = payload.get("errors")
+        if isinstance(errors, list) and not (status in (401, 403)) and any(
+            isinstance(e, dict) and isinstance(e.get("message"), str) and "auth" in e["message"].lower()
+            for e in errors
+        ):
+            lines.append(
+                "Hint: Message mentions authentication. Verify the API token in ~/.tunnel/credentials.json is "
+                "valid; tunnel delete needs permission to remove tunnels (e.g. Account/Cloudflare Tunnel/Edit) "
+                "in addition to DNS permissions used during init."
+            )
+        if isinstance(errors, list) and errors:
+            lines.append("errors:")
+            for i, err in enumerate(errors, start=1):
+                if not isinstance(err, dict):
+                    lines.append(f"  {i}. {err!r}")
+                    continue
+                code = err.get("code")
+                msg = err.get("message")
+                doc = err.get("documentation_url")
+                chain = err.get("error_chain")
+                parts: list[str] = []
+                if code is not None:
+                    parts.append(f"code={code!r}")
+                if isinstance(msg, str) and msg:
+                    parts.append(f"message={msg!r}")
+                if isinstance(doc, str) and doc:
+                    parts.append(f"doc={doc}")
+                if parts:
+                    lines.append(f"  {i}. " + ", ".join(parts))
+                for key, val in err.items():
+                    if key in {"code", "message", "documentation_url", "error_chain"}:
+                        continue
+                    if val is not None and val != []:
+                        lines.append(f"      {key}: {val!r}")
+                if isinstance(chain, list) and chain:
+                    try:
+                        chain_text = json.dumps(chain, indent=2)[:3000]
+                    except (TypeError, ValueError):
+                        chain_text = repr(chain)[:3000]
+                    lines.append("      error_chain:\n" + "\n".join("        " + line for line in chain_text.splitlines()))
+
+        other_msgs = payload.get("messages")
+        if (
+            isinstance(other_msgs, list)
+            and other_msgs
+            and other_msgs is not errors
+        ):
+            lines.append("messages:")
+            for m in other_msgs:
+                if isinstance(m, dict):
+                    lines.append("  " + json.dumps(m, default=str)[:2000])
+                else:
+                    lines.append(f"  {m!r}")
+
+        if payload.get("success") is not None:
+            lines.append(f"success field in body: {payload.get('success')!r}")
+        try:
+            body_preview = json.dumps(payload, indent=2, default=str)[:8000]
+        except (TypeError, ValueError):
+            body_preview = repr(payload)[:8000]
+        lines.append("full JSON body:")
+        lines.append(body_preview)
+
+        raise click.ClickException("\n".join(lines))
+
+    def _response_json_or_raise(self, method: str, path: str, response: requests.Response) -> Any:
+        try:
+            return response.json()
+        except ValueError:
+            raw = (response.text or "")[:4000]
+            extra = f" cf-ray={response.headers.get('cf-ray')!r}" if response.headers.get("cf-ray") else ""
+            raise click.ClickException(
+                f"Cloudflare API {method} {path} returned non-JSON (HTTP {response.status_code}){extra}:\n{raw}"
+            ) from None
+
+    def _parse_v4_response(self, method: str, path: str, response: requests.Response) -> dict[str, Any]:
+        payload = self._response_json_or_raise(method, path, response)
+        if not isinstance(payload, dict):
+            raise click.ClickException(
+                f"Cloudflare API {method} {path} returned JSON that was not an object: {type(payload).__name__!r}\n"
+                f"Raw: {str(payload)[:2000]!r}"
+            )
+        if response.ok and payload.get("success") is True:
+            return payload
+        self._raise_v4_error(method, path, response, payload)
+        raise AssertionError
+
     def request(
         self,
         method: str,
@@ -53,26 +166,9 @@ class CloudflareClient:
                 timeout=30,
             )
         except requests.RequestException as exc:
-            raise click.ClickException(f"Cloudflare request failed: {exc}") from exc
+            raise click.ClickException(f"Network error calling Cloudflare API {method} {path}: {exc}") from exc
 
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise click.ClickException(f"Cloudflare returned non-JSON response: HTTP {response.status_code}") from exc
-
-        if response.ok and payload.get("success") is True:
-            return payload
-
-        errors = payload.get("errors")
-        if isinstance(errors, list) and errors:
-            messages: list[str] = []
-            for error in errors:
-                if isinstance(error, dict) and isinstance(error.get("message"), str):
-                    messages.append(error["message"])
-            if messages:
-                raise click.ClickException("; ".join(messages))
-
-        raise click.ClickException(f"Cloudflare request failed: HTTP {response.status_code}")
+        return self._parse_v4_response(method, path, response)
 
     def verify_token(self, account_id: str | None = None) -> None:
         if account_id is None:
@@ -198,6 +294,36 @@ class CloudflareClient:
                 return
 
         self.request("POST", f"/zones/{zone_id}/dns_records", json_body=record_payload)
+
+    @staticmethod
+    def _normalize_dns_target(value: str) -> str:
+        return value.rstrip(".").lower()
+
+    def delete_dns_cname_to_tunnel(self, zone_id: str, hostname: str, tunnel_id: str) -> int:
+        """Delete CNAME(s) in the zone for hostname that point to {tunnel_id}.cfargotunnel.com. Returns count removed."""
+        target = self._normalize_dns_target(f"{tunnel_id}.cfargotunnel.com")
+        payload = self.request(
+            "GET",
+            f"/zones/{zone_id}/dns_records",
+            params={"type": "CNAME", "name": hostname, "per_page": 50},
+        )
+        result = payload.get("result")
+        if not isinstance(result, list):
+            raise click.ClickException("Cloudflare DNS records response was not a list")
+
+        removed = 0
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            record_id = item.get("id")
+            if not isinstance(content, str) or not isinstance(record_id, str):
+                continue
+            if self._normalize_dns_target(content) != target:
+                continue
+            self.request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+            removed += 1
+        return removed
 
     def tunnel_status(self, account_id: str, tunnel_id: str) -> dict[str, Any]:
         payload = self.request("GET", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}")
