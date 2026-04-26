@@ -1,6 +1,6 @@
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -88,18 +88,7 @@ def parse_tunnel_config(raw: dict[str, Any]) -> TunnelConfig:
         raise click.ClickException(f"invalid service_port in {config_path()}") from exc
 
     values: dict[str, str] = {}
-    for key in [
-        "account_id",
-        "zone_id",
-        "zone_name",
-        "tunnel_id",
-        "tunnel_name",
-        "hostname",
-        "cloudflared_config",
-        "cloudflared_credentials",
-        "service_scheme",
-        "service_host",
-    ]:
+    for key in (field.name for field in fields(TunnelConfig) if field.name != "service_port"):
         value = raw.get(key)
         if not isinstance(value, str) or not value.strip():
             raise click.ClickException(f"missing {key} in {config_path()}")

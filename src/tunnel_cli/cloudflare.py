@@ -1,6 +1,4 @@
-import base64
 import json
-import secrets
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,12 +6,6 @@ import click
 import requests
 
 API_BASE_URL = "https://api.cloudflare.com/client/v4"
-
-
-@dataclass(frozen=True)
-class Account:
-    id: str
-    name: str
 
 
 @dataclass(frozen=True)
@@ -60,7 +52,7 @@ class CloudflareClient:
             )
 
         errors = payload.get("errors")
-        if isinstance(errors, list) and not (status in (401, 403)) and any(
+        if isinstance(errors, list) and status not in (401, 403) and any(
             isinstance(e, dict) and isinstance(e.get("message"), str) and "auth" in e["message"].lower()
             for e in errors
         ):
@@ -100,18 +92,14 @@ class CloudflareClient:
                         chain_text = repr(chain)[:3000]
                     lines.append("      error_chain:\n" + "\n".join("        " + line for line in chain_text.splitlines()))
 
-        other_msgs = payload.get("messages")
-        if (
-            isinstance(other_msgs, list)
-            and other_msgs
-            and other_msgs is not errors
-        ):
+        messages = payload.get("messages")
+        if isinstance(messages, list) and messages and messages is not errors:
             lines.append("messages:")
-            for m in other_msgs:
-                if isinstance(m, dict):
-                    lines.append("  " + json.dumps(m, default=str)[:2000])
+            for message in messages:
+                if isinstance(message, dict):
+                    lines.append("  " + json.dumps(message, default=str)[:2000])
                 else:
-                    lines.append(f"  {m!r}")
+                    lines.append(f"  {message!r}")
 
         if payload.get("success") is not None:
             lines.append(f"success field in body: {payload.get('success')!r}")
@@ -170,6 +158,20 @@ class CloudflareClient:
 
         return self._parse_v4_response(method, path, response)
 
+    def result_list(self, method: str, path: str, *, params: dict[str, Any] | None = None, label: str) -> list[Any]:
+        result = self.request(method, path, params=params).get("result")
+        if not isinstance(result, list):
+            raise click.ClickException(f"Cloudflare {label} response was not a list")
+        return result
+
+    def dns_records(self, zone_id: str, hostname: str) -> list[Any]:
+        return self.result_list(
+            "GET",
+            f"/zones/{zone_id}/dns_records",
+            params={"type": "CNAME", "name": hostname, "per_page": 50},
+            label="DNS records",
+        )
+
     def verify_token(self, account_id: str | None = None) -> None:
         if account_id is None:
             self.request("GET", "/user/tokens/verify")
@@ -177,30 +179,9 @@ class CloudflareClient:
 
         self.request("GET", f"/accounts/{account_id}/tokens/verify")
 
-    def list_accounts(self) -> list[Account]:
-        payload = self.request("GET", "/accounts", params={"per_page": 50})
-        result = payload.get("result")
-        if not isinstance(result, list):
-            raise click.ClickException("Cloudflare accounts response was not a list")
-
-        accounts: list[Account] = []
-        for item in result:
-            if not isinstance(item, dict):
-                continue
-            account_id = item.get("id")
-            name = item.get("name")
-            if isinstance(account_id, str) and isinstance(name, str):
-                accounts.append(Account(id=account_id, name=name))
-        return accounts
-
     def list_zones(self) -> list[Zone]:
-        payload = self.request("GET", "/zones", params={"per_page": 50})
-        result = payload.get("result")
-        if not isinstance(result, list):
-            raise click.ClickException("Cloudflare zones response was not a list")
-
         zones: list[Zone] = []
-        for item in result:
+        for item in self.result_list("GET", "/zones", params={"per_page": 50}, label="zones"):
             if not isinstance(item, dict):
                 continue
             zone_id = item.get("id")
@@ -217,13 +198,13 @@ class CloudflareClient:
         return zones
 
     def list_tunnels(self, account_id: str) -> list[CloudflareTunnel]:
-        payload = self.request("GET", f"/accounts/{account_id}/cfd_tunnel", params={"is_deleted": "false"})
-        result = payload.get("result")
-        if not isinstance(result, list):
-            raise click.ClickException("Cloudflare tunnels response was not a list")
-
         tunnels: list[CloudflareTunnel] = []
-        for item in result:
+        for item in self.result_list(
+            "GET",
+            f"/accounts/{account_id}/cfd_tunnel",
+            params={"is_deleted": "false"},
+            label="tunnels",
+        ):
             if not isinstance(item, dict):
                 continue
             tunnel_id = item.get("id")
@@ -232,52 +213,8 @@ class CloudflareClient:
                 tunnels.append(CloudflareTunnel(id=tunnel_id, name=name))
         return tunnels
 
-    def get_or_create_tunnel(self, account_id: str, tunnel_name: str) -> CloudflareTunnel:
-        for tunnel in self.list_tunnels(account_id):
-            if tunnel.name == tunnel_name:
-                return tunnel
-
-        secret = base64.b64encode(secrets.token_bytes(32)).decode("ascii")
-        payload = self.request(
-            "POST",
-            f"/accounts/{account_id}/cfd_tunnel",
-            json_body={"name": tunnel_name, "tunnel_secret": secret},
-        )
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            raise click.ClickException("Cloudflare tunnel create response was not an object")
-
-        tunnel_id = result.get("id")
-        name = result.get("name")
-        if not isinstance(tunnel_id, str) or not isinstance(name, str):
-            raise click.ClickException("Cloudflare tunnel create response was missing id/name")
-        return CloudflareTunnel(id=tunnel_id, name=name)
-
-    def configure_tunnel(self, account_id: str, tunnel_id: str, hostname: str, service_url: str) -> None:
-        self.request(
-            "PUT",
-            f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/configurations",
-            json_body={
-                "config": {
-                    "ingress": [
-                        {"hostname": hostname, "service": service_url},
-                        {"service": "http_status:404"},
-                    ]
-                }
-            },
-        )
-
     def upsert_dns_cname(self, zone_id: str, hostname: str, tunnel_id: str) -> None:
         target = f"{tunnel_id}.cfargotunnel.com"
-        payload = self.request(
-            "GET",
-            f"/zones/{zone_id}/dns_records",
-            params={"type": "CNAME", "name": hostname, "per_page": 50},
-        )
-        result = payload.get("result")
-        if not isinstance(result, list):
-            raise click.ClickException("Cloudflare DNS records response was not a list")
-
         record_payload = {
             "type": "CNAME",
             "name": hostname,
@@ -285,7 +222,7 @@ class CloudflareClient:
             "ttl": 1,
             "proxied": True,
         }
-        for item in result:
+        for item in self.dns_records(zone_id, hostname):
             if not isinstance(item, dict):
                 continue
             record_id = item.get("id")
@@ -300,19 +237,9 @@ class CloudflareClient:
         return value.rstrip(".").lower()
 
     def delete_dns_cname_to_tunnel(self, zone_id: str, hostname: str, tunnel_id: str) -> int:
-        """Delete CNAME(s) in the zone for hostname that point to {tunnel_id}.cfargotunnel.com. Returns count removed."""
         target = self._normalize_dns_target(f"{tunnel_id}.cfargotunnel.com")
-        payload = self.request(
-            "GET",
-            f"/zones/{zone_id}/dns_records",
-            params={"type": "CNAME", "name": hostname, "per_page": 50},
-        )
-        result = payload.get("result")
-        if not isinstance(result, list):
-            raise click.ClickException("Cloudflare DNS records response was not a list")
-
         removed = 0
-        for item in result:
+        for item in self.dns_records(zone_id, hostname):
             if not isinstance(item, dict):
                 continue
             content = item.get("content")
@@ -324,17 +251,3 @@ class CloudflareClient:
             self.request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
             removed += 1
         return removed
-
-    def tunnel_status(self, account_id: str, tunnel_id: str) -> dict[str, Any]:
-        payload = self.request("GET", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}")
-        result = payload.get("result")
-        if not isinstance(result, dict):
-            raise click.ClickException("Cloudflare tunnel status response was not an object")
-        return result
-
-    def tunnel_token(self, account_id: str, tunnel_id: str) -> str:
-        payload = self.request("GET", f"/accounts/{account_id}/cfd_tunnel/{tunnel_id}/token")
-        result = payload.get("result")
-        if not isinstance(result, str) or not result:
-            raise click.ClickException("Cloudflare tunnel token response was missing token")
-        return result

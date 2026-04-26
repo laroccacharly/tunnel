@@ -1,5 +1,4 @@
 import json
-import os
 import shutil
 import socket
 import subprocess
@@ -94,13 +93,9 @@ def string_config_default(values: dict[str, Any], key: str, fallback: str) -> st
 def port_config_default(values: dict[str, Any]) -> int | None:
     try:
         port = int(values["service_port"])
-    except (TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return None
-    except KeyError:
-        return None
-    if 1 <= port <= 65535:
-        return port
-    return None
+    return port if 1 <= port <= 65535 else None
 
 
 def suffix_config_default(values: dict[str, Any], zone_name: str) -> str:
@@ -117,6 +112,12 @@ def suffix_config_default(values: dict[str, Any], zone_name: str) -> str:
 def save_init_progress(values: dict[str, Any], **updates: Any) -> None:
     values.update(updates)
     save_tunnel_config_values(values)
+
+
+def prompt_saved_string(values: dict[str, Any], key: str, text: str, fallback: str) -> str:
+    value = click.prompt(text, default=string_config_default(values, key, fallback)).strip()
+    save_init_progress(values, **{key: value})
+    return value
 
 
 def prompt_credentials(existing: Credentials | None) -> Credentials:
@@ -149,13 +150,9 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
-def run_command(command: list[str], env_overrides: dict[str, str] | None = None) -> None:
-    env = None
-    if env_overrides is not None:
-        env = dict(os.environ)
-        env.update(env_overrides)
+def run_command(command: list[str]) -> None:
     try:
-        subprocess.run(command, check=True, env=env)
+        subprocess.run(command, check=True)
     except FileNotFoundError as exc:
         raise click.ClickException(f"command not found: {command[0]}") from exc
     except subprocess.CalledProcessError as exc:
@@ -278,10 +275,6 @@ def ensure_cloudflared_login() -> None:
     raise click.ClickException("missing cloudflared login certificate; run `cloudflared tunnel login` first")
 
 
-def route_cloudflared_dns(tunnel: CloudflareTunnel, hostname: str) -> None:
-    run_command(["cloudflared", "tunnel", "route", "dns", "--overwrite-dns", tunnel.id, hostname])
-
-
 def write_cloudflared_config(config: TunnelConfig) -> None:
     path = cloudflared_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -307,6 +300,21 @@ def check_tcp_port(host: str, port: int, timeout: float = 2.0) -> bool:
             return True
     except OSError:
         return False
+
+
+def cloudflare_tunnel_check(tunnel_id: str) -> tuple[str, bool, str]:
+    try:
+        run_command_output(["cloudflared", "tunnel", "info", tunnel_id])
+        return "cloudflare-tunnel", True, tunnel_id
+    except click.ClickException as exc:
+        return "cloudflare-tunnel", False, str(exc)
+
+
+def public_dns_check(hostname: str) -> tuple[str, bool, str]:
+    try:
+        return "public-dns", bool(socket.getaddrinfo(hostname, 443)), hostname
+    except OSError as exc:
+        return "public-dns", False, str(exc)
 
 
 @click.group()
@@ -336,9 +344,12 @@ def init() -> None:
         zone_name=zone.name,
     )
 
-    tunnel_name_default = string_config_default(config_values, "tunnel_name", f"tunnel-{zone.name.replace('.', '-')}")
-    tunnel_name = click.prompt("Tunnel name", default=tunnel_name_default).strip()
-    save_init_progress(config_values, tunnel_name=tunnel_name)
+    tunnel_name = prompt_saved_string(
+        config_values,
+        "tunnel_name",
+        "Tunnel name",
+        f"tunnel-{zone.name.replace('.', '-')}",
+    )
 
     suffix = click.prompt("Hostname suffix/subdomain", default=suffix_config_default(config_values, zone.name)).strip()
     hostname = build_hostname(suffix, zone.name)
@@ -350,14 +361,13 @@ def init() -> None:
     scheme = click.prompt("Local service scheme", default=scheme_default, type=click.Choice(["http", "https"]))
     save_init_progress(config_values, service_scheme=scheme)
 
-    host = click.prompt("Local service host", default=string_config_default(config_values, "service_host", "localhost")).strip()
-    save_init_progress(config_values, service_host=host)
+    host = prompt_saved_string(config_values, "service_host", "Local service host", "localhost")
 
     port_default = port_config_default(config_values)
-    if port_default is None:
-        port = click.prompt("Local service port", type=click.IntRange(min=1, max=65535))
-    else:
-        port = click.prompt("Local service port", default=port_default, type=click.IntRange(min=1, max=65535))
+    port_kwargs = {"type": click.IntRange(min=1, max=65535)}
+    if port_default is not None:
+        port_kwargs["default"] = port_default
+    port = click.prompt("Local service port", **port_kwargs)
     save_init_progress(config_values, service_port=port)
 
     ensure_cloudflared_login()
@@ -415,45 +425,29 @@ def status() -> None:
 @cli.command()
 def doctor() -> None:
     config = require_config()
-    checks: list[tuple[str, bool, str]] = []
-
-    checks.append(("config-file", config_path().exists(), str(config_path())))
-    checks.append(("credentials-file", credentials_path().exists(), str(credentials_path())))
-    checks.append(("cloudflared-config", Path(config.cloudflared_config).exists(), config.cloudflared_config))
-    checks.append(("cloudflared-credentials", Path(config.cloudflared_credentials).exists(), config.cloudflared_credentials))
-    checks.append(
+    checks = [
+        ("config-file", config_path().exists(), str(config_path())),
+        ("credentials-file", credentials_path().exists(), str(credentials_path())),
+        ("cloudflared-config", Path(config.cloudflared_config).exists(), config.cloudflared_config),
+        ("cloudflared-credentials", Path(config.cloudflared_credentials).exists(), config.cloudflared_credentials),
         (
             "local-service",
             check_tcp_port(config.service_host, config.service_port),
             config.service_url,
-        )
-    )
+        ),
+        cloudflare_tunnel_check(config.tunnel_id),
+        public_dns_check(config.hostname),
+    ]
 
-    try:
-        run_command_output(["cloudflared", "tunnel", "info", config.tunnel_id])
-        checks.append(("cloudflare-tunnel", True, config.tunnel_id))
-    except click.ClickException as exc:
-        checks.append(("cloudflare-tunnel", False, str(exc)))
-
-    try:
-        answers = socket.getaddrinfo(config.hostname, 443)
-        checks.append(("public-dns", bool(answers), config.hostname))
-    except OSError as exc:
-        checks.append(("public-dns", False, str(exc)))
-
-    failed = False
     for name, ok, detail in checks:
-        if not ok:
-            failed = True
         click.echo(f"{'[OK]' if ok else '[FAIL]'} {name}: {detail}")
-    if failed:
+    if any(not ok for _, ok, _ in checks):
         raise click.ClickException("doctor checks failed")
 
 
 @cli.command(name="delete")
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation.")
 def delete_tunnel(yes: bool) -> None:
-    """Delete the tunnel CNAME in DNS (API), delete the tunnel in Cloudflare (cloudflared), then remove local files."""
     if not command_exists("cloudflared"):
         raise click.ClickException("command not found: cloudflared")
 
@@ -474,7 +468,6 @@ def delete_tunnel(yes: bool) -> None:
     else:
         click.echo(f"No CNAME for {config.hostname} pointing at this tunnel (API; skipped or already removed).")
 
-    # Uses ~/.cloudflared/cert.pem (cloudflared tunnel login), not the API token.
     run_command(["cloudflared", "tunnel", "delete", "-f", config.tunnel_name])
     click.echo(f"Deleted Cloudflare tunnel {config.tunnel_name} (via cloudflared).")
 
