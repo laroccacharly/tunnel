@@ -9,7 +9,7 @@ description = "Interactive Cloudflare Tunnel CLI"
 requires-python = ">=3.12"
 dependencies = [
     "click>=8.1.0",
-    "fastapi>=0.136.1",
+    "fastapi[standard]>=0.136.1",
     "pydantic>=2.0.0",
     "requests>=2.31.0",
     "uvicorn>=0.46.0",
