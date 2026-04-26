@@ -115,6 +115,14 @@ def resolve_credentials(tunnel_id: str) -> str | None:
     return None
 
 
+def remove_credentials_file(path: str) -> bool:
+    credentials_file = Path(path)
+    if not credentials_file.exists():
+        return False
+    credentials_file.unlink()
+    return True
+
+
 def create_tunnel(tunnel_name: str) -> tuple[CloudflareTunnel, str]:
     existing = find_tunnel(tunnel_name)
     if existing is not None:

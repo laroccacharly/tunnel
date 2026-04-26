@@ -33,6 +33,13 @@ from .prompts import (
 )
 
 
+STALE_TUNNEL_MARKERS = (
+    "tunnel not found",
+    "found 0 tunnels",
+    "unauthorized: tunnel not found",
+)
+
+
 def require_config() -> TunnelConfig:
     config = load_tunnel_config()
     if config is None:
@@ -45,6 +52,74 @@ def require_credentials() -> Credentials:
     if credentials is None:
         raise click.ClickException(f"missing credentials; run `tunnel init` first ({credentials_path()})")
     return credentials
+
+
+def is_missing_cloudflare_tunnel_error(message: str) -> bool:
+    normalized = message.lower()
+    return any(marker in normalized for marker in STALE_TUNNEL_MARKERS)
+
+
+def cloudflare_tunnel_exists(config: TunnelConfig) -> tuple[bool, str]:
+    try:
+        cloudflared.run_command_output(["cloudflared", "tunnel", "info", config.tunnel_id])
+        return True, config.tunnel_id
+    except click.ClickException as exc:
+        return False, str(exc)
+
+
+def recreate_configured_tunnel(config: TunnelConfig) -> TunnelConfig:
+    credentials = require_credentials()
+    client = CloudflareClient(credentials.api_token)
+
+    removed = cloudflared.remove_credentials_file(config.cloudflared_credentials)
+    if removed:
+        click.echo(f"Removed stale tunnel credentials: {config.cloudflared_credentials}")
+
+    tunnel, tunnel_credentials = cloudflared.create_tunnel(config.tunnel_name)
+    client.upsert_dns_cname(config.zone_id, config.hostname, tunnel.id)
+
+    repaired = config.model_copy(
+        update={
+            "tunnel_id": tunnel.id,
+            "tunnel_name": tunnel.name,
+            "cloudflared_credentials": tunnel_credentials,
+        }
+    )
+    save_tunnel_config(repaired)
+    cloudflared.write_config(repaired)
+    click.echo(f"Recreated tunnel {repaired.tunnel_name} ({repaired.tunnel_id}).")
+    click.echo(f"Updated DNS: https://{repaired.hostname} -> {repaired.service_url}")
+    return repaired
+
+
+def prompt_missing_tunnel_recovery(config: TunnelConfig, detail: str) -> TunnelConfig | None:
+    click.echo(f"Configured tunnel {config.tunnel_name} ({config.tunnel_id}) was not found by Cloudflare.")
+    click.echo(f"Detail: {detail}")
+    choice = click.prompt(
+        "Choose recovery action",
+        type=click.Choice(["recreate", "init", "skip"], case_sensitive=False),
+        default="recreate",
+        show_choices=True,
+    ).lower()
+    if choice == "recreate":
+        return recreate_configured_tunnel(config)
+    if choice == "init":
+        click.echo("Run `tunnel init` to choose values interactively.")
+        return None
+
+    click.echo("Leaving existing config unchanged.")
+    return None
+
+
+def ensure_configured_tunnel_available(config: TunnelConfig, *, prompt: bool) -> TunnelConfig:
+    exists, detail = cloudflare_tunnel_exists(config)
+    if exists:
+        return config
+    if prompt and is_missing_cloudflare_tunnel_error(detail):
+        repaired = prompt_missing_tunnel_recovery(config, detail)
+        if repaired is not None:
+            return repaired
+    raise click.ClickException(detail)
 
 
 @click.group(help="Set up and run a Cloudflare Tunnel for a local service.")
@@ -134,7 +209,7 @@ def show_config() -> None:
 
 @cli.command(help="Start cloudflared in the background and write process state under ~/.tunnel.")
 def run() -> None:
-    config = require_config()
+    config = ensure_configured_tunnel_available(require_config(), prompt=True)
     existing = load_state()
     if existing is not None:
         if state_process_is_running(existing):
@@ -195,15 +270,28 @@ def status() -> None:
     else:
         clear_state()
         click.echo(f"process: not running (removed stale state for pid {state.pid})")
+    config = ensure_configured_tunnel_available(config, prompt=click.get_text_stream("stdin").isatty())
     cloudflared.run_command(["cloudflared", "tunnel", "info", config.tunnel_id])
 
 
 @cli.command(help="Run local checks for config, dependencies, DNS, and service reachability.")
 def doctor() -> None:
-    checks = checks_for(require_config())
-    for name, ok, detail in checks:
-        click.echo(f"{'[OK]' if ok else '[FAIL]'} {name}: {detail}")
-    if any(not ok for _, ok, _ in checks):
+    config = require_config()
+    checks = checks_for(config)
+    tunnel_check = next((check for check in checks if check.name == "cloudflare-tunnel"), None)
+    if (
+        tunnel_check is not None
+        and not tunnel_check.ok
+        and click.get_text_stream("stdin").isatty()
+        and is_missing_cloudflare_tunnel_error(tunnel_check.detail)
+    ):
+        repaired = prompt_missing_tunnel_recovery(config, tunnel_check.detail)
+        if repaired is not None:
+            checks = checks_for(repaired)
+
+    for check in checks:
+        click.echo(f"{'[OK]' if check.ok else '[FAIL]'} {check.name}: {check.description}; result: {check.detail}")
+    if any(not check.ok for check in checks):
         raise click.ClickException("doctor checks failed")
 
 
