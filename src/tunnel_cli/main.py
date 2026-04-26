@@ -9,6 +9,7 @@ from .cloudflare import CloudflareClient
 from .config import (
     Credentials,
     TunnelConfig,
+    clear_incomplete_tunnel_config,
     load_credentials,
     load_tunnel_config,
     load_tunnel_config_values,
@@ -46,70 +47,75 @@ def require_credentials() -> Credentials:
     return credentials
 
 
-@click.group()
+@click.group(help="Set up and run a Cloudflare Tunnel for a local service.")
 def cli() -> None:
     pass
 
 
-@cli.command()
+@cli.command(help="Interactively create tunnel config, DNS, and local cloudflared files.")
 def init() -> None:
-    if not cloudflared.command_exists("cloudflared"):
-        raise click.ClickException("command not found: cloudflared")
-
     config_values = load_tunnel_config_values()
-    credentials = prompt_credentials()
-    client = CloudflareClient(credentials.api_token)
+    try:
+        if not cloudflared.command_exists("cloudflared"):
+            raise click.ClickException("command not found: cloudflared")
 
-    if credentials.account_id is None:
-        raise click.ClickException("missing account ID; run `tunnel init` again")
+        credentials = prompt_credentials()
+        client = CloudflareClient(credentials.api_token)
 
-    zones = zones_for_account(client.list_zones(), credentials.account_id)
-    zone = choose_zone(zones, string_config_default(config_values, "zone_id", "") or None)
-    save_init_progress(config_values, account_id=credentials.account_id, zone_id=zone.id, zone_name=zone.name)
+        if credentials.account_id is None:
+            raise click.ClickException("missing account ID; run `tunnel init` again")
 
-    tunnel_name = prompt_saved_string(
-        config_values,
-        "tunnel_name",
-        "Tunnel name",
-        f"tunnel-{zone.name.replace('.', '-')}",
-    )
-    suffix = click.prompt("Hostname suffix/subdomain", default=suffix_config_default(config_values, zone.name)).strip()
-    hostname = build_hostname(suffix, zone.name)
-    save_init_progress(config_values, hostname=hostname)
+        zones = zones_for_account(client.list_zones(), credentials.account_id)
+        zone = choose_zone(zones, string_config_default(config_values, "zone_id", "") or None)
+        save_init_progress(config_values, account_id=credentials.account_id, zone_id=zone.id, zone_name=zone.name)
 
-    scheme_default = string_config_default(config_values, "service_scheme", "http")
-    scheme_default = scheme_default if scheme_default in ["http", "https"] else "http"
-    scheme = click.prompt("Local service scheme", default=scheme_default, type=click.Choice(["http", "https"]))
-    save_init_progress(config_values, service_scheme=scheme)
+        tunnel_name = prompt_saved_string(
+            config_values,
+            "tunnel_name",
+            "Tunnel name",
+            f"tunnel-{zone.name.replace('.', '-')}",
+        )
+        suffix = click.prompt("Hostname suffix/subdomain", default=suffix_config_default(config_values, zone.name)).strip()
+        hostname = build_hostname(suffix, zone.name)
+        save_init_progress(config_values, hostname=hostname)
 
-    host = prompt_saved_string(config_values, "service_host", "Local service host", "localhost")
-    port_kwargs = {"type": click.IntRange(min=1, max=65535)}
-    port_default = port_config_default(config_values)
-    if port_default is not None:
-        port_kwargs["default"] = port_default
-    port = click.prompt("Local service port", **port_kwargs)
-    save_init_progress(config_values, service_port=port)
+        scheme_default = string_config_default(config_values, "service_scheme", "http")
+        scheme_default = scheme_default if scheme_default in ["http", "https"] else "http"
+        scheme = click.prompt("Local service scheme", default=scheme_default, type=click.Choice(["http", "https"]))
+        save_init_progress(config_values, service_scheme=scheme)
 
-    cloudflared.ensure_login()
-    tunnel, tunnel_credentials = cloudflared.create_tunnel(tunnel_name)
-    client.upsert_dns_cname(zone.id, hostname, tunnel.id)
+        host = prompt_saved_string(config_values, "service_host", "Local service host", "localhost")
+        port_kwargs = {"type": click.IntRange(min=1, max=65535)}
+        port_default = port_config_default(config_values)
+        if port_default is not None:
+            port_kwargs["default"] = port_default
+        port = click.prompt("Local service port", **port_kwargs)
+        save_init_progress(config_values, service_port=port)
 
-    config = TunnelConfig(
-        account_id=credentials.account_id,
-        zone_id=zone.id,
-        zone_name=zone.name,
-        tunnel_id=tunnel.id,
-        tunnel_name=tunnel.name,
-        hostname=hostname,
-        cloudflared_config=str(cloudflared_config_path()),
-        cloudflared_credentials=tunnel_credentials,
-        service_scheme=scheme,
-        service_host=host,
-        service_port=port,
-    )
-    save_credentials(Credentials(api_token=credentials.api_token, account_id=credentials.account_id))
-    save_tunnel_config(config)
-    cloudflared.write_config(config)
+        cloudflared.ensure_login()
+        tunnel, tunnel_credentials = cloudflared.create_tunnel(tunnel_name)
+        client.upsert_dns_cname(zone.id, hostname, tunnel.id)
+
+        config = TunnelConfig(
+            account_id=credentials.account_id,
+            zone_id=zone.id,
+            zone_name=zone.name,
+            tunnel_id=tunnel.id,
+            tunnel_name=tunnel.name,
+            hostname=hostname,
+            cloudflared_config=str(cloudflared_config_path()),
+            cloudflared_credentials=tunnel_credentials,
+            service_scheme=scheme,
+            service_host=host,
+            service_port=port,
+        )
+        save_credentials(Credentials(api_token=credentials.api_token, account_id=credentials.account_id))
+        save_tunnel_config(config)
+        cloudflared.write_config(config)
+    except click.ClickException:
+        if clear_incomplete_tunnel_config():
+            click.echo(f"Removed incomplete config: {config_path()}")
+        raise
 
     click.echo(f"Wrote config: {config_path()}")
     click.echo(f"Wrote cloudflared config: {cloudflared_config_path()}")
@@ -117,7 +123,7 @@ def init() -> None:
     click.echo("Run `tunnel run` to start the tunnel.")
 
 
-@cli.command(name="config")
+@cli.command(name="config", help="Print the saved tunnel configuration and credentials location.")
 def show_config() -> None:
     config = require_config()
     click.echo(json.dumps({**config.model_dump(), "service_url": config.service_url}, indent=2, sort_keys=True))
@@ -126,7 +132,7 @@ def show_config() -> None:
         click.echo(f"credentials: {credentials_path()} ({redact_token(credentials.api_token)})")
 
 
-@cli.command()
+@cli.command(help="Start cloudflared in the background and write process state under ~/.tunnel.")
 def run() -> None:
     config = require_config()
     existing = load_state()
@@ -144,7 +150,7 @@ def run() -> None:
     click.echo("Run `tunnel log` to follow logs, or `tunnel stop` to stop it.")
 
 
-@cli.command(name="log")
+@cli.command(name="log", help="Tail the background tunnel log file.")
 @click.option("--lines", "-n", default=100, show_default=True, type=click.IntRange(min=0), help="Initial lines to show.")
 def show_log(lines: int) -> None:
     state = load_state()
@@ -160,7 +166,7 @@ def show_log(lines: int) -> None:
         raise click.ClickException(f"tail exited with {exc.returncode}") from exc
 
 
-@cli.command()
+@cli.command(help="Stop the background tunnel process recorded in ~/.tunnel/state.json.")
 def stop() -> None:
     state = load_state()
     if state is None:
@@ -174,7 +180,7 @@ def stop() -> None:
         click.echo(f"Tunnel process {state.pid} was not running; removed stale state.")
 
 
-@cli.command()
+@cli.command(help="Show tunnel endpoints, process state, and cloudflared tunnel info.")
 def status() -> None:
     config = require_config()
     click.echo(f"hostname: https://{config.hostname}")
@@ -192,7 +198,7 @@ def status() -> None:
     cloudflared.run_command(["cloudflared", "tunnel", "info", config.tunnel_id])
 
 
-@cli.command()
+@cli.command(help="Run local checks for config, dependencies, DNS, and service reachability.")
 def doctor() -> None:
     checks = checks_for(require_config())
     for name, ok, detail in checks:
@@ -201,7 +207,7 @@ def doctor() -> None:
         raise click.ClickException("doctor checks failed")
 
 
-@cli.command(name="delete")
+@cli.command(name="delete", help="Delete the Cloudflare tunnel, DNS record, and local tunnel config.")
 @click.option("--yes", "-y", is_flag=True, help="Do not ask for confirmation.")
 def delete_tunnel(yes: bool) -> None:
     if not cloudflared.command_exists("cloudflared"):

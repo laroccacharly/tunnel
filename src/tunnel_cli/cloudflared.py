@@ -108,21 +108,30 @@ def find_tunnel(tunnel_name: str) -> CloudflareTunnel | None:
     return None
 
 
-def resolve_credentials(tunnel_id: str) -> str:
+def resolve_credentials(tunnel_id: str) -> str | None:
     for candidate in [cloudflared_credentials_path(), Path.home() / ".cloudflared" / f"{tunnel_id}.json"]:
         if candidate.exists():
             return str(candidate)
-    raise click.ClickException(
-        f"found existing tunnel {tunnel_id}, but no local credentials file; "
-        "choose a new tunnel name or recreate the tunnel with cloudflared"
-    )
+    return None
 
 
 def create_tunnel(tunnel_name: str) -> tuple[CloudflareTunnel, str]:
     existing = find_tunnel(tunnel_name)
     if existing is not None:
-        click.echo(f"Using existing cloudflared tunnel {existing.name} ({existing.id})")
-        return existing, resolve_credentials(existing.id)
+        credentials = resolve_credentials(existing.id)
+        if credentials is not None:
+            click.echo(f"Using existing cloudflared tunnel {existing.name} ({existing.id})")
+            return existing, credentials
+
+        click.echo(
+            f"Found existing cloudflared tunnel {existing.name} ({existing.id}), "
+            "but no local credentials file."
+        )
+        if click.confirm("Delete and recreate this tunnel now?", default=True):
+            run_command(["cloudflared", "tunnel", "delete", "-f", existing.name])
+            click.echo(f"Deleted existing cloudflared tunnel {existing.name} ({existing.id}).")
+        else:
+            raise click.ClickException("choose a different tunnel name or recreate the tunnel with cloudflared")
 
     credentials_file = cloudflared_credentials_path()
     raw = run_json(

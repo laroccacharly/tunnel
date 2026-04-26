@@ -48,6 +48,9 @@ class TunnelConfig(BaseModel):
         return f"{self.service_scheme}://{self.service_host}:{self.service_port}"
 
 
+TUNNEL_CONFIG_FIELDS = set(TunnelConfig.model_fields)
+
+
 class Credentials(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -110,11 +113,28 @@ def save_credentials(credentials: Credentials) -> None:
     write_json_file(credentials_path(), credentials.model_dump(exclude_none=True), secret=True)
 
 
+def tunnel_config_missing_fields(raw: dict[str, Any]) -> list[str]:
+    return sorted(TUNNEL_CONFIG_FIELDS - raw.keys())
+
+
 def parse_tunnel_config(raw: dict[str, Any]) -> TunnelConfig:
+    missing_fields = tunnel_config_missing_fields(raw)
+    if missing_fields:
+        missing = ", ".join(missing_fields)
+        config_path().unlink(missing_ok=True)
+        click.echo(f"Removed incomplete config: {config_path()}")
+        raise click.ClickException(
+            f"missing config fields: {missing}. Run `tunnel init` to finish setup."
+        )
+
     try:
         return TunnelConfig.model_validate(raw)
     except ValidationError as exc:
-        raise click.ClickException(f"invalid config in {config_path()}: {exc}") from exc
+        config_path().unlink(missing_ok=True)
+        click.echo(f"Removed invalid config: {config_path()}")
+        raise click.ClickException(
+            f"Run `tunnel init` to recreate it. Details: {exc}"
+        ) from exc
 
 
 def load_tunnel_config() -> TunnelConfig | None:
@@ -133,6 +153,20 @@ def load_tunnel_config_values() -> dict[str, Any]:
 
 def save_tunnel_config_values(values: dict[str, Any]) -> None:
     write_json_file(config_path(), values)
+
+
+def clear_tunnel_config() -> bool:
+    if not config_path().exists():
+        return False
+    config_path().unlink()
+    return True
+
+
+def clear_incomplete_tunnel_config() -> bool:
+    raw = read_json_file(config_path())
+    if raw is None or not tunnel_config_missing_fields(raw):
+        return False
+    return clear_tunnel_config()
 
 
 def save_tunnel_config(config: TunnelConfig) -> None:
