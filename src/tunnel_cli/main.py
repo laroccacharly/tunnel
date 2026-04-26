@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import click
@@ -16,7 +17,8 @@ from .config import (
     save_tunnel_config,
 )
 from .doctor import checks_for
-from .paths import cloudflared_config_path, config_path, credentials_path
+from .paths import cloudflared_config_path, config_path, credentials_path, log_path, state_path
+from .process import clear_state, load_state, start_tunnel_process, state_process_is_running, stop_tunnel_process
 from .prompts import (
     build_hostname,
     choose_zone,
@@ -127,7 +129,49 @@ def show_config() -> None:
 @cli.command()
 def run() -> None:
     config = require_config()
-    cloudflared.run_command(["cloudflared", "tunnel", "--config", config.cloudflared_config, "run", config.tunnel_id])
+    existing = load_state()
+    if existing is not None:
+        if state_process_is_running(existing):
+            click.echo(f"Tunnel is already running in the background (pid {existing.pid}).")
+            click.echo(f"Logs: {existing.log_file}")
+            return
+        clear_state()
+
+    command = ["cloudflared", "tunnel", "--config", config.cloudflared_config, "run", config.tunnel_id]
+    state = start_tunnel_process(command, config.tunnel_id)
+    click.echo(f"Started tunnel in the background (pid {state.pid}).")
+    click.echo(f"Logs: {state.log_file}")
+    click.echo("Run `tunnel log` to follow logs, or `tunnel stop` to stop it.")
+
+
+@cli.command(name="log")
+@click.option("--lines", "-n", default=100, show_default=True, type=click.IntRange(min=0), help="Initial lines to show.")
+def show_log(lines: int) -> None:
+    state = load_state()
+    path = Path(state.log_file) if state is not None else log_path()
+    if not path.exists():
+        raise click.ClickException(f"missing log file: {path}")
+
+    try:
+        subprocess.run(["tail", "-n", str(lines), "-f", str(path)], check=True)
+    except FileNotFoundError as exc:
+        raise click.ClickException("command not found: tail") from exc
+    except subprocess.CalledProcessError as exc:
+        raise click.ClickException(f"tail exited with {exc.returncode}") from exc
+
+
+@cli.command()
+def stop() -> None:
+    state = load_state()
+    if state is None:
+        click.echo(f"Tunnel is not running; no process state found at {state_path()}.")
+        return
+
+    stopped = stop_tunnel_process(state)
+    if stopped:
+        click.echo(f"Stopped tunnel process {state.pid}.")
+    else:
+        click.echo(f"Tunnel process {state.pid} was not running; removed stale state.")
 
 
 @cli.command()
@@ -136,6 +180,15 @@ def status() -> None:
     click.echo(f"hostname: https://{config.hostname}")
     click.echo(f"service: {config.service_url}")
     click.echo(f"tunnel: {config.tunnel_name} ({config.tunnel_id})")
+    state = load_state()
+    if state is None:
+        click.echo("process: not running")
+    elif state_process_is_running(state):
+        click.echo(f"process: running (pid {state.pid})")
+        click.echo(f"logs: {state.log_file}")
+    else:
+        clear_state()
+        click.echo(f"process: not running (removed stale state for pid {state.pid})")
     cloudflared.run_command(["cloudflared", "tunnel", "info", config.tunnel_id])
 
 

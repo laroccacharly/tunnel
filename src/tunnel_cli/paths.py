@@ -19,3 +19,11 @@ def cloudflared_credentials_path() -> Path:
 
 def credentials_path() -> Path:
     return tunnel_home() / "credentials.json"
+
+
+def state_path() -> Path:
+    return tunnel_home() / "state.json"
+
+
+def log_path() -> Path:
+    return tunnel_home() / "cloudflared.log"
