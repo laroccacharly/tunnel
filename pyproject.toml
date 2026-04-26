@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tunnel-cli"
+version = "0.1.0"
+description = "Interactive Cloudflare Tunnel CLI"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.1.0",
+    "fastapi>=0.136.1",
+    "requests>=2.31.0",
+    "uvicorn>=0.46.0",
+]
+
+[project.scripts]
+tunnel = "tunnel_cli.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tunnel_cli"]
