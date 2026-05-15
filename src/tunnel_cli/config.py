@@ -173,6 +173,20 @@ def save_tunnel_config(config: TunnelConfig) -> None:
     write_json_file(config_path(), config.model_dump())
 
 
+def require_config() -> TunnelConfig:
+    config = load_tunnel_config()
+    if config is None:
+        raise click.ClickException(f"missing config; run `tunnel init` first ({config_path()})")
+    return config
+
+
+def require_credentials() -> Credentials:
+    credentials = load_credentials()
+    if credentials is None:
+        raise click.ClickException(f"missing credentials; run `tunnel init` first ({credentials_path()})")
+    return credentials
+
+
 def redact_token(token: str) -> str:
     if len(token) <= 8:
         return "********"

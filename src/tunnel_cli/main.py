@@ -6,6 +6,7 @@ import click
 
 from . import cloudflared
 from .cloudflare import CloudflareClient
+from .challenge import challenge_group
 from .config import (
     Credentials,
     TunnelConfig,
@@ -14,6 +15,8 @@ from .config import (
     load_tunnel_config,
     load_tunnel_config_values,
     redact_token,
+    require_config,
+    require_credentials,
     save_credentials,
     save_tunnel_config,
 )
@@ -38,20 +41,6 @@ STALE_TUNNEL_MARKERS = (
     "found 0 tunnels",
     "unauthorized: tunnel not found",
 )
-
-
-def require_config() -> TunnelConfig:
-    config = load_tunnel_config()
-    if config is None:
-        raise click.ClickException(f"missing config; run `tunnel init` first ({config_path()})")
-    return config
-
-
-def require_credentials() -> Credentials:
-    credentials = load_credentials()
-    if credentials is None:
-        raise click.ClickException(f"missing credentials; run `tunnel init` first ({credentials_path()})")
-    return credentials
 
 
 def is_missing_cloudflare_tunnel_error(message: str) -> bool:
@@ -125,6 +114,9 @@ def ensure_configured_tunnel_available(config: TunnelConfig, *, prompt: bool) ->
 @click.group(help="Set up and run a Cloudflare Tunnel for a local service.")
 def cli() -> None:
     pass
+
+
+cli.add_command(challenge_group)
 
 
 @cli.command(help="Interactively create tunnel config, DNS, and local cloudflared files.")
